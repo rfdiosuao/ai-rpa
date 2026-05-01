@@ -16,6 +16,7 @@ from ai_rpa.engine.prompt_builder import (
     build_generation_prompt,
 )
 from ai_rpa.registry.keyword_registry import KeywordRegistry
+from ai_rpa.pattern_store import PatternStore
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +30,25 @@ class GeneratedScript:
     libraries_needed: list[str] = field(default_factory=list)
     explanation: str = ""
     categories: list[str] = field(default_factory=list)
+    from_pattern: bool = False   # True if reused from pattern store (free!)
+    pattern_id: str = ""         # Pattern ID if reused
 
 
 class ScriptGenerator:
-    """Generate Robot Framework scripts from natural language task descriptions."""
+    """Generate Robot Framework scripts from natural language task descriptions.
 
-    def __init__(self, config: AirPaConfig, registry: KeywordRegistry):
+    Flow:
+    1. Search pattern store first (free, instant)
+    2. If no match → AI intent classification (cheap)
+    3. AI script generation with targeted keyword context (expensive)
+    4. On success → save to pattern store for future reuse
+    """
+
+    def __init__(self, config: AirPaConfig, registry: KeywordRegistry,
+                 pattern_store: PatternStore | None = None):
         self._config = config
         self._registry = registry
+        self._pattern_store = pattern_store or PatternStore()
         self._ai = AIClient(
             api_key=config.openai_api_key,
             model=config.openai_model,
@@ -44,28 +56,80 @@ class ScriptGenerator:
         )
 
     def generate(self, task: str) -> GeneratedScript:
-        """Generate a Robot Framework script from a natural language task.
+        """Generate a Robot Framework script from a natural language task."""
+        # Step 1: Search pattern store (free!)
+        match = self._search_patterns(task)
+        if match:
+            return match
 
-        Two-stage process:
-        1. Classify intent → determine categories
-        2. Generate script with targeted keyword context
-        """
-        # Stage 1: Intent classification
+        # Step 2: AI intent classification
         print("[分析意图...]", end=" ", flush=True)
         categories = self._classify_intent(task)
         category_str = ", ".join(categories)
         print(f"→ {category_str}")
 
-        # Stage 2: Get keyword context for relevant categories
+        # Step 3: Search pattern store with categories
+        match = self._search_patterns(task, categories=categories)
+        if match:
+            return match
+
+        # Step 4: Get keyword context and generate via AI
         keyword_context = self._registry.get_compact_context(categories)
         print(f"[加载关键字...] → 来自相关库的 {len(keyword_context.splitlines())} 个关键字")
 
-        # Stage 3: Generate script
         print("[生成脚本...]", end=" ", flush=True)
-        script_result = self._generate_script(task, keyword_context)
+        script_result = self._generate_script(task, keyword_context, categories)
         print("完成")
 
         return script_result
+
+    def _search_patterns(self, task: str, categories: list[str] | None = None) -> GeneratedScript | None:
+        """Search pattern store for a matching reusable pattern."""
+        results = self._pattern_store.search(task, categories=categories, min_similarity=0.6)
+
+        if not results:
+            return None
+
+        best_pattern, score = results[0]
+
+        # High-confidence match: reuse directly
+        if score >= 0.75:
+            print(f"[模式复用] 找到相似模式 (相似度 {score:.0%}) → {best_pattern.explanation}")
+            try:
+                suite = TestSuite.from_string(best_pattern.robot_text)
+            except DataError:
+                # Pattern has syntax errors, remove it
+                self._pattern_store.delete(best_pattern.id)
+                return None
+
+            self._pattern_store.record_success(best_pattern.id)
+            return GeneratedScript(
+                robot_text=best_pattern.robot_text,
+                suite=suite,
+                libraries_needed=best_pattern.libraries_needed,
+                explanation=best_pattern.explanation,
+                categories=best_pattern.categories,
+                from_pattern=True,
+                pattern_id=best_pattern.id,
+            )
+
+        # Medium-confidence match: show as suggestion, still generate new
+        if score >= 0.6:
+            print(f"[模式参考] 找到相似模式 (相似度 {score:.0%}): {best_pattern.task_description}")
+            print(f"           → 仍将生成新脚本，但参考历史模式")
+
+        return None
+
+    def save_pattern(self, task: str, script: GeneratedScript) -> str:
+        """Save a successful script as a reusable pattern."""
+        pattern = self._pattern_store.add(
+            task=task,
+            categories=script.categories,
+            robot_text=script.robot_text,
+            libraries_needed=script.libraries_needed,
+            explanation=script.explanation,
+        )
+        return pattern.id
 
     def _classify_intent(self, task: str) -> list[str]:
         """Use AI to classify the task into operation categories."""
@@ -78,16 +142,18 @@ class ScriptGenerator:
             return categories
         except Exception as e:
             logger.warning("Intent classification failed, using general: %s", e)
-            return ["general"]
+            # Fallback: use local pattern matching
+            from ai_rpa.scenarios.scenario_matcher import match_categories
+            return match_categories(task)
 
-    def _generate_script(self, task: str, keyword_context: str) -> GeneratedScript:
+    def _generate_script(self, task: str, keyword_context: str,
+                         categories: list[str]) -> GeneratedScript:
         """Use AI to generate a Robot Framework script."""
         system, user = build_generation_prompt(task, keyword_context)
 
         try:
             result = self._ai.chat_json(system, user, temperature=0.1)
         except json.JSONDecodeError:
-            # If JSON parsing fails, try to extract script from raw response
             logger.warning("JSON parsing failed, attempting raw extraction")
             raw = self._ai.chat(system, user, json_mode=False, temperature=0.1)
             result = {"script": raw, "libraries_needed": [], "explanation": ""}
@@ -101,7 +167,6 @@ class ScriptGenerator:
             suite = TestSuite.from_string(robot_text)
         except DataError as e:
             logger.warning("Generated script has syntax error: %s", e)
-            # Attempt auto-fix: add minimal structure if missing
             robot_text = self._auto_fix_structure(robot_text, str(e))
             try:
                 suite = TestSuite.from_string(robot_text)
@@ -113,6 +178,7 @@ class ScriptGenerator:
             suite=suite,
             libraries_needed=libraries,
             explanation=explanation,
+            categories=categories,
         )
 
     def regenerate_with_error(
@@ -123,7 +189,6 @@ class ScriptGenerator:
         """Regenerate a script after execution failure, using error context."""
         from ai_rpa.engine.prompt_builder import build_recovery_prompt
 
-        # Get keyword context (use all categories to give AI more options)
         categories = self._classify_intent(task)
         keyword_context = self._registry.get_compact_context(categories, max_keywords=100)
 
@@ -153,17 +218,16 @@ class ScriptGenerator:
             suite=suite,
             libraries_needed=libraries,
             explanation=explanation,
+            categories=categories,
         )
 
     def _auto_fix_structure(self, robot_text: str, error: str) -> str:
         """Attempt to fix common structural issues in generated scripts."""
         text = robot_text.strip()
 
-        # If missing *** Settings *** section, add it
         if "*** Settings ***" not in text:
             text = "*** Settings ***\n\n" + text
 
-        # If missing *** Test Cases *** section, wrap content
         if "*** Test Cases ***" not in text:
             text += "\n\n*** Test Cases ***\nRPA Task\n    No Operation\n"
 
